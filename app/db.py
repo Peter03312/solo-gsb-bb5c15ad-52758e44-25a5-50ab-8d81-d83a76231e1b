@@ -274,6 +274,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ship_review_state_once
 
 CREATE INDEX IF NOT EXISTS idx_ship_review_handover_batch
     ON shipment_review(handover_no, batch_no, id);
+
+-- 装车交接批次退货（已装车交接批次退回仓库）：凭唯一退回号对一笔已存在的交接
+-- 登记部分/全部批次退回。退回记录只追加、不可变——冻结对原交接主记录与逐批
+-- 交接冻结快照的引用（不复制快照内容，原交接记录与发运后复核历史均不可改写）。
+-- 同一原交接允许多笔部分退回，但同一 (原交接, 批次) 至多被退回一次
+-- （主键在数据库层兜底“已退回批次再退即整体拒绝”）。
+CREATE TABLE IF NOT EXISTS shipment_return (
+    return_no        TEXT PRIMARY KEY,
+    handover_no      TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    reason           TEXT NOT NULL,             -- 非空退回原因（不允许空白）
+    batch_count      INTEGER NOT NULL,          -- 本次退回批次数（允许小于原交接批次数=部分退回）
+    returned_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_return_handover ON shipment_return(handover_no);
+
+-- 退回逐批成员：仅冻结“原交接 + 原交接内顺序号 + 批次”的引用关系；逐批冻结快照
+-- 始终经由 handover_no + batch_no 引用 shipment_handover_batch 的不可变副本，
+-- 不在本表复制，避免与原交接快照出现两份可分叉的内容。
+CREATE TABLE IF NOT EXISTS shipment_return_batch (
+    return_no        TEXT NOT NULL REFERENCES shipment_return(return_no),
+    handover_no      TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    position         INTEGER NOT NULL,          -- 该批在原交接清单中的顺序号（原序引用）
+    batch_no         TEXT NOT NULL REFERENCES batch(batch_no),
+    PRIMARY KEY (return_no, batch_no),
+    UNIQUE (handover_no, batch_no)              -- 同批对同一交接至多退回一次
+);
+
+CREATE INDEX IF NOT EXISTS idx_return_batch_batch
+    ON shipment_return_batch(batch_no);
+CREATE INDEX IF NOT EXISTS idx_return_batch_handover
+    ON shipment_return_batch(handover_no, position);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）

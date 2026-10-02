@@ -76,6 +76,19 @@ class HandoverIn(BaseModel):
     )
 
 
+class HandoverReturnIn(BaseModel):
+    return_no: str = Field(..., description="退回号（全局唯一）；重复退回号整体拒绝（DUPLICATE_RETURN）")
+    batch_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="本次退回的批次号清单：必须是该原交接内的批次，非空、不可重复、不得含已退回批次；允许少于原交接清单（部分退回），按提交顺序保存，顺序号引用原交接",
+    )
+    reason: str = Field(
+        ...,
+        description="退回原因（必填，不允许空白）；退回记录只追加，空或纯空白整体拒绝（INVALID_PAYLOAD）",
+    )
+
+
 class ShipmentReviewDecisionIn(BaseModel):
     seen_adjudication_version: int = Field(
         ...,

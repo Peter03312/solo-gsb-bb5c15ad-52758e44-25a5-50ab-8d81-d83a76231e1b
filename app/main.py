@@ -14,6 +14,7 @@ from .schemas import (
     BatchVoidIn,
     CleaningCorrection,
     HandoverIn,
+    HandoverReturnIn,
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
@@ -29,9 +30,11 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         title="食品换线放行服务",
         description=(
             "面向共用产线的生产批次过敏原换线放行：登记原料批号与批次、"
-            "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询。"
+            "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询；"
+            "出货核验、整单装车交接与已交接批次退货（部分退回、新单核验后再发运）、"
+            "发运后质量复核。"
         ),
-        version="1.0.0",
+        version="1.1.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -252,9 +255,11 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def create_handover(body: HandoverIn, service: Service = Depends(svc)):
         """装车交接：凭唯一交接号、已确认核验单号及读取时修订号登记整单发运。
 
-        只接受仍为 CONFIRMED 且修订号匹配的单据；逐批校验有效、当前裁决/出货资格
+        只接受仍为 CONFIRMED 且修订号匹配、且从未交接过的单据；逐批校验有效、当前裁决/出货资格
         版本与最近一次确认快照一致且结论分别为 RELEASE / SHIPPABLE；任一批次已在其他
-        交接记录中发运即整单拒绝。一次事务占用全单批次并冻结单号、修订号、逐批确认
+        交接记录中发运即整单拒绝。已退回批次须纳入新核验单重新确认后方可再发运，
+        不得凭同一张已确认单据再次交接（VERIFICATION_ALREADY_HANDED_OVER）。
+        一次事务占用全单批次并冻结单号、修订号、逐批确认
         快照与交接时间；后续更正、待复核或清单修订不改写交接记录。重复交接号、未知
         单据、状态/版本冲突、任一不合格批次均整体拒绝，不留下部分占用。
         """
@@ -276,8 +281,50 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
 
     @app.get("/api/batches/{batch_no}/handover", tags=["装车交接"])
     def get_batch_handover(batch_no: str, service: Service = Depends(svc)):
-        """追溯单批的交接归属（未发运返回 shipped=false；未知批次 404）。"""
+        """追溯单批的历次交接/退回与当前去向（未占用返回 shipped=false；未知批次 404）。
+
+        handovers 按交接时间列出该批历次交接，逐条标注是否已退回及对应退回号/原因/时间；
+        current_whereabouts 给出当前是否仍占用发运名额（SHIPPED / AVAILABLE）。
+        """
         return service.get_batch_handover(batch_no)
+
+    # ---------------- 已装车交接批次退货 ----------------
+
+    @app.post("/api/handovers/{handover_no}/returns", tags=["交接批次退货"], status_code=201)
+    def register_handover_return(handover_no: str, body: HandoverReturnIn, service: Service = Depends(svc)):
+        """登记已装车交接批次的退货：凭原交接号、唯一退回号、非空原因与该交接内
+        非空且无重复的批次清单登记（允许部分退回）。
+
+        成功则在单事务内写入只追加退回记录（冻结对原交接与逐批快照的引用）并释放
+        本批发运占用；未退回批次仍占用发运名额。退回批次转为可再次发运，但须纳入
+        **新核验单**完成当前版本确认，新交接仍按有效批次、放行、出货资格与版本规则
+        逐批校验；同一张已确认单据不得凭原交接再次交接。原交接记录与其发运后复核
+        历史均不可改写，原交接详情仍显示当时完整清单（逐批追加退回标记）。
+        重复退回号 409（DUPLICATE_RETURN）、未知交接 404（HANDOVER_NOT_FOUND）、
+        空/空白原因、空清单、清单重复 400、非本交接（含未知批次）或已退回批次 422
+        （RETURN_NOT_ALLOWED，details 逐批 BATCH_NOT_IN_HANDOVER /
+        BATCH_ALREADY_RETURNED）——全部整体拒绝，不写入退回记录、不留下部分释放。
+        """
+        return service.register_return(
+            handover_no, body.return_no, body.batch_nos, body.reason
+        )
+
+    @app.get("/api/handovers/{handover_no}/returns", tags=["交接批次退货"])
+    def list_handover_returns(handover_no: str, service: Service = Depends(svc)):
+        """列出某笔原交接下的退回记录（只追加，按退回时间排序）；未知交接 404。"""
+        return service.list_returns(handover_no)
+
+    @app.get("/api/returns", tags=["交接批次退货"])
+    def list_all_returns(
+        handover_no: str | None = None, service: Service = Depends(svc)
+    ):
+        """列出全部退回记录；可按 ?handover_no= 原交接号过滤（该交接未知则 404）。"""
+        return service.list_returns(handover_no)
+
+    @app.get("/api/returns/{return_no}", tags=["交接批次退货"])
+    def get_return(return_no: str, service: Service = Depends(svc)):
+        """查询单笔退回：冻结的原交接引用、退回原因、逐批原交接顺序号与逐批冻结快照引用。"""
+        return service.get_return(return_no)
 
     # ---------------- 已发运批次发运后质量复核 ----------------
 
