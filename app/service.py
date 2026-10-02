@@ -2268,6 +2268,282 @@ class Service:
                 },
             }
 
+    # ------------------------------------------------------------ 交接退回（退货登记）
+
+    def create_return(
+        self, return_no: str, handover_no: str, reason: str, batch_nos: list[str]
+    ) -> dict[str, Any]:
+        """登记已装车交接批次的退货（允许部分退回）。
+
+        凭唯一退回号、原交接号、非空原因与该交接内非空无重复的批次清单登记退回：
+        退回记录冻结原交接单号/修订号/确认引用与逐批交接快照副本（只追加、不可变），
+        原交接记录与发运后复核历史均不改写；退回批次在同一事务内释放发运占用，
+        转为可再次发运（仍须纳入新核验单完成当前版本确认后经新交接发运）；
+        未退回批次仍占用发运名额。
+
+        重复退回号 409、未知交接 404、空原因/空清单 400、清单内重复批次 400、
+        非本交接批次 404、已退回批次 409——全部在同一 BEGIN IMMEDIATE 事务内校验，
+        任一失败整体回滚，不留下部分释放。
+        """
+        return_no = (return_no or "").strip()
+        handover_no = (handover_no or "").strip()
+        reason = (reason or "").strip()
+        if not return_no:
+            raise bad_request("INVALID_PAYLOAD", "return_no 不能为空")
+        if not handover_no:
+            raise bad_request("INVALID_PAYLOAD", "handover_no 不能为空")
+        if not reason:
+            raise bad_request(
+                "INVALID_PAYLOAD", "reason 不能为空：登记退回必须填写非空原因"
+            )
+        if not isinstance(batch_nos, list) or not batch_nos:
+            raise bad_request("INVALID_PAYLOAD", "batch_nos 必须是非空批次号数组")
+        normalized: list[str] = []
+        for bn in batch_nos:
+            if not isinstance(bn, str) or not bn.strip():
+                raise bad_request("INVALID_PAYLOAD", "batch_nos 必须是非空字符串数组")
+            bn = bn.strip()
+            if bn in normalized:
+                raise bad_request(
+                    "DUPLICATE_BATCH_IN_RETURN", f"批次号在退回清单中重复: {bn}"
+                )
+            normalized.append(bn)
+
+        with self.store.write() as conn:
+            # 1) 退回号须唯一
+            if conn.execute(
+                "SELECT 1 FROM shipment_return WHERE return_no = ?", (return_no,)
+            ).fetchone():
+                raise conflict("DUPLICATE_RETURN", f"退回号已存在: {return_no}")
+
+            # 2) 原交接须存在（退回冻结其单号/修订号/确认引用，原记录不改写）
+            hrow = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            if not hrow:
+                raise not_found(
+                    "HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}"
+                )
+
+            # 3) 批次清单须全部属于该交接：取原交接逐批冻结快照作为退回快照来源
+            hb_rows = conn.execute(
+                """SELECT * FROM shipment_handover_batch
+                   WHERE handover_no = ? ORDER BY position""",
+                (handover_no,),
+            ).fetchall()
+            by_batch = {r["batch_no"]: r for r in hb_rows}
+            not_in = [bn for bn in normalized if bn not in by_batch]
+            if not_in:
+                raise not_found(
+                    "BATCH_NOT_IN_HANDOVER",
+                    f"批次不属于交接 {handover_no}，整笔退回拒绝: {', '.join(not_in)}",
+                    [
+                        {
+                            "batch_no": bn,
+                            "reason_code": "BATCH_NOT_IN_HANDOVER",
+                            "handover_no": handover_no,
+                            "message": f"批次不在交接 {handover_no} 的清单内，不能随该交接退回",
+                        }
+                        for bn in not_in
+                    ],
+                )
+
+            # 4) 任一批次已退回 -> 整体拒绝（唯一索引另在数据库层兜底并发）
+            placeholders = ",".join("?" * len(normalized))
+            already = conn.execute(
+                f"""SELECT rb.batch_no AS batch_no, rb.return_no AS return_no,
+                           r.returned_at AS returned_at
+                    FROM shipment_return_batch rb
+                    JOIN shipment_return r ON r.return_no = rb.return_no
+                    WHERE rb.handover_no = ? AND rb.batch_no IN ({placeholders})
+                    ORDER BY rb.batch_no""",
+                [handover_no, *normalized],
+            ).fetchall()
+            if already:
+                raise conflict(
+                    "BATCH_ALREADY_RETURNED",
+                    "清单含已退回批次，整笔退回拒绝，不留下部分释放",
+                    [
+                        {
+                            "batch_no": r["batch_no"],
+                            "reason_code": "BATCH_ALREADY_RETURNED",
+                            "handover_no": handover_no,
+                            "return_no": r["return_no"],
+                            "returned_at": r["returned_at"],
+                            "message": (
+                                f"批次已随退回 {r['return_no']} 登记退回，"
+                                "同一交接内不得重复退回"
+                            ),
+                        }
+                        for r in already
+                    ],
+                )
+
+            # 5) 全部校验通过：写退回主记录 + 逐批冻结快照副本，并同事务释放占用
+            now = _now()
+            conn.execute(
+                """INSERT INTO shipment_return
+                   (return_no, handover_no, verification_no, verification_revision,
+                    confirmation_id, reason, batch_count, returned_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    return_no,
+                    handover_no,
+                    hrow["verification_no"],
+                    hrow["verification_revision"],
+                    hrow["confirmation_id"],
+                    reason,
+                    len(normalized),
+                    now,
+                ),
+            )
+            try:
+                conn.executemany(
+                    """INSERT INTO shipment_return_batch
+                       (return_no, position, batch_no, handover_no, handover_position,
+                        confirmation_id, snapshot_version, snapshot_disposition,
+                        snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                        snapshot_ship_version, snapshot_ship_status,
+                        snapshot_locked_lots, snapshot_ship_reasons)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            return_no,
+                            position,
+                            bn,
+                            handover_no,
+                            by_batch[bn]["position"],
+                            by_batch[bn]["confirmation_id"],
+                            by_batch[bn]["snapshot_version"],
+                            by_batch[bn]["snapshot_disposition"],
+                            by_batch[bn]["snapshot_actual"],
+                            by_batch[bn]["snapshot_undeclared"],
+                            by_batch[bn]["snapshot_reasons"],
+                            by_batch[bn]["snapshot_ship_version"],
+                            by_batch[bn]["snapshot_ship_status"],
+                            by_batch[bn]["snapshot_locked_lots"],
+                            by_batch[bn]["snapshot_ship_reasons"],
+                        )
+                        for position, bn in enumerate(normalized, start=1)
+                    ],
+                )
+            except sqlite3.IntegrityError as exc:
+                # 并发下唯一索引 (handover_no, batch_no) 兜底：同一批不得重复退回
+                raise conflict(
+                    "BATCH_ALREADY_RETURNED",
+                    "清单含已退回批次（并发提交），整笔退回拒绝，不留下部分释放",
+                ) from exc
+
+            # 退回批次释放发运名额（occupancy 为“当前未退回占用”）；未退回批次不动
+            conn.executemany(
+                "DELETE FROM shipment_handover_occupancy WHERE batch_no = ?",
+                [(bn,) for bn in normalized],
+            )
+
+            rrow = conn.execute(
+                "SELECT * FROM shipment_return WHERE return_no = ?", (return_no,)
+            ).fetchone()
+            return _return_payload(conn, rrow)
+
+    def list_returns(self, handover_no: str | None = None) -> dict[str, Any]:
+        """列出交接退回记录（可按原交接号过滤），按退回时间排序。"""
+        with self.store.read() as conn:
+            if handover_no:
+                rows = conn.execute(
+                    """SELECT * FROM shipment_return WHERE handover_no = ?
+                       ORDER BY returned_at, return_no""",
+                    (handover_no,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM shipment_return ORDER BY returned_at, return_no"
+                ).fetchall()
+            return {"returns": [_return_summary(conn, r) for r in rows]}
+
+    def get_return(self, return_no: str) -> dict[str, Any]:
+        """查询单笔退回：冻结的原交接引用与逐批交接快照副本、退回原因与时间。"""
+        with self.store.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM shipment_return WHERE return_no = ?", (return_no,)
+            ).fetchone()
+            if not row:
+                raise not_found("RETURN_NOT_FOUND", f"退回记录不存在: {return_no}")
+            return _return_payload(conn, row)
+
+    def get_batch_handovers(self, batch_no: str) -> dict[str, Any]:
+        """按批次查询历次交接、退回及当前去向。
+
+        每批同一时刻最多一笔未退回交接：current 为当前占用（未退回）的交接；
+        handovers 按交接时间列出该批出现过的全部交接，逐笔标注是否已退回及退回记录。
+        """
+        with self.store.read() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone():
+                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            rows = conn.execute(
+                """SELECT hb.handover_no AS handover_no, hb.position AS position,
+                          h.verification_no AS verification_no,
+                          h.verification_revision AS verification_revision,
+                          h.confirmation_id AS confirmation_id,
+                          h.handed_over_at AS handed_over_at,
+                          rb.return_no AS return_no, r.returned_at AS returned_at,
+                          r.reason AS return_reason
+                   FROM shipment_handover_batch hb
+                   JOIN shipment_handover h ON h.handover_no = hb.handover_no
+                   LEFT JOIN shipment_return_batch rb
+                          ON rb.handover_no = hb.handover_no AND rb.batch_no = hb.batch_no
+                   LEFT JOIN shipment_return r ON r.return_no = rb.return_no
+                   WHERE hb.batch_no = ?
+                   ORDER BY h.handed_over_at, hb.handover_no""",
+                (batch_no,),
+            ).fetchall()
+            occ = conn.execute(
+                """SELECT oc.handover_no AS handover_no, oc.position AS position,
+                          h.verification_no AS verification_no,
+                          h.verification_revision AS verification_revision,
+                          h.confirmation_id AS confirmation_id,
+                          h.handed_over_at AS handed_over_at
+                   FROM shipment_handover_occupancy oc
+                   JOIN shipment_handover h ON h.handover_no = oc.handover_no
+                   WHERE oc.batch_no = ?""",
+                (batch_no,),
+            ).fetchone()
+            handovers = [
+                {
+                    "handover_no": r["handover_no"],
+                    "position": r["position"],
+                    "verification_no": r["verification_no"],
+                    "verification_revision": r["verification_revision"],
+                    "confirmation_id": r["confirmation_id"],
+                    "handed_over_at": r["handed_over_at"],
+                    "returned": r["return_no"] is not None,
+                    "return": None
+                    if r["return_no"] is None
+                    else {
+                        "return_no": r["return_no"],
+                        "reason": r["return_reason"],
+                        "returned_at": r["returned_at"],
+                    },
+                }
+                for r in rows
+            ]
+            return {
+                "batch_no": batch_no,
+                "shipped": occ is not None,
+                "current": None
+                if occ is None
+                else {
+                    "handover_no": occ["handover_no"],
+                    "position": occ["position"],
+                    "verification_no": occ["verification_no"],
+                    "verification_revision": occ["verification_revision"],
+                    "confirmation_id": occ["confirmation_id"],
+                    "handed_over_at": occ["handed_over_at"],
+                },
+                "handovers": handovers,
+            }
+
     # ------------------------------------------------------------ 发运后质量复核
 
     def list_handover_reviews(self, handover_no: str) -> dict[str, Any]:
@@ -2990,14 +3266,29 @@ def _refresh_snapshots(
 
 
 def _handover_batches(conn, handover_no: str) -> list[dict[str, Any]]:
-    """交接记录中逐批冻结的确认快照（不可变副本）。"""
+    """交接记录中逐批冻结的确认快照（不可变副本）。
+
+    退回不改写交接记录：逐批快照保持交接时原样，另附 returned/return 标记
+    标明该批此后是否已随某笔退回登记（原交接详情仍显示当时完整清单）。
+    """
     rows = conn.execute(
-        """SELECT position, batch_no, confirmation_id, snapshot_version,
-                  snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
-                  snapshot_ship_version, snapshot_ship_status,
-                  snapshot_locked_lots, snapshot_ship_reasons
-           FROM shipment_handover_batch
-           WHERE handover_no = ? ORDER BY position""",
+        """SELECT hb.position AS position, hb.batch_no AS batch_no,
+                  hb.confirmation_id AS confirmation_id, hb.snapshot_version AS snapshot_version,
+                  hb.snapshot_disposition AS snapshot_disposition,
+                  hb.snapshot_actual AS snapshot_actual,
+                  hb.snapshot_undeclared AS snapshot_undeclared,
+                  hb.snapshot_reasons AS snapshot_reasons,
+                  hb.snapshot_ship_version AS snapshot_ship_version,
+                  hb.snapshot_ship_status AS snapshot_ship_status,
+                  hb.snapshot_locked_lots AS snapshot_locked_lots,
+                  hb.snapshot_ship_reasons AS snapshot_ship_reasons,
+                  rb.return_no AS return_no, r.returned_at AS returned_at,
+                  r.reason AS return_reason
+           FROM shipment_handover_batch hb
+           LEFT JOIN shipment_return_batch rb
+                  ON rb.handover_no = hb.handover_no AND rb.batch_no = hb.batch_no
+           LEFT JOIN shipment_return r ON r.return_no = rb.return_no
+           WHERE hb.handover_no = ? ORDER BY hb.position""",
         (handover_no,),
     ).fetchall()
     return [
@@ -3018,13 +3309,40 @@ def _handover_batches(conn, handover_no: str) -> list[dict[str, Any]]:
                 "locked_lots": loads(r["snapshot_locked_lots"]),
                 "reasons": loads(r["snapshot_ship_reasons"]),
             },
+            "returned": r["return_no"] is not None,
+            "return": None
+            if r["return_no"] is None
+            else {
+                "return_no": r["return_no"],
+                "reason": r["return_reason"],
+                "returned_at": r["returned_at"],
+            },
         }
         for r in rows
     ]
 
 
+def _handover_returns(conn, handover_no: str) -> list[dict[str, Any]]:
+    """该交接已登记的退回记录摘要（只追加；不影响交接当时完整清单）。"""
+    return [
+        _return_summary(conn, r)
+        for r in conn.execute(
+            """SELECT * FROM shipment_return WHERE handover_no = ?
+               ORDER BY returned_at, return_no""",
+            (handover_no,),
+        ).fetchall()
+    ]
+
+
 def _handover_payload(conn, row) -> dict[str, Any]:
-    """单次交接完整负载：冻结的单号/修订号/确认引用/交接时间 + 逐批确认快照。"""
+    """单次交接完整负载：冻结的单号/修订号/确认引用/交接时间 + 逐批确认快照。
+
+    逐批清单始终为交接当时的完整清单；已登记退回的批次以 returned/return 标注，
+    顶层 returns 汇总该交接的退回记录，原交接记录本身不改写。
+    """
+    batches = _handover_batches(conn, row["handover_no"])
+    returns = _handover_returns(conn, row["handover_no"])
+    returned_count = sum(1 for b in batches if b["returned"])
     return {
         "handover_no": row["handover_no"],
         "verification_no": row["verification_no"],
@@ -3033,12 +3351,15 @@ def _handover_payload(conn, row) -> dict[str, Any]:
         "confirmed_at": row["confirmed_at"],
         "batch_count": row["batch_count"],
         "handed_over_at": row["handed_over_at"],
-        "batches": _handover_batches(conn, row["handover_no"]),
+        "returned_batch_count": returned_count,
+        "fully_returned": returned_count == row["batch_count"],
+        "returns": returns,
+        "batches": batches,
     }
 
 
 def _handover_summary(conn, row) -> dict[str, Any]:
-    """交接列表项：不含逐批快照详情，仅成员顺序/批号。"""
+    """交接列表项：不含逐批快照详情，仅成员顺序/批号与退回计数。"""
     members = [
         {"position": r["position"], "batch_no": r["batch_no"]}
         for r in conn.execute(
@@ -3047,6 +3368,10 @@ def _handover_summary(conn, row) -> dict[str, Any]:
             (row["handover_no"],),
         ).fetchall()
     ]
+    returned_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM shipment_return_batch WHERE handover_no = ?",
+        (row["handover_no"],),
+    ).fetchone()["n"]
     return {
         "handover_no": row["handover_no"],
         "verification_no": row["verification_no"],
@@ -3054,7 +3379,90 @@ def _handover_summary(conn, row) -> dict[str, Any]:
         "confirmation_id": row["confirmation_id"],
         "confirmed_at": row["confirmed_at"],
         "batch_count": row["batch_count"],
+        "returned_batch_count": returned_count,
         "handed_over_at": row["handed_over_at"],
+        "batches": members,
+    }
+
+
+# ---------------------------------------------------------------- 交接退回序列化
+
+
+def _return_batches(conn, return_no: str) -> list[dict[str, Any]]:
+    """退回记录中逐批冻结的原交接确认快照副本（不可变）。"""
+    rows = conn.execute(
+        """SELECT position, batch_no, handover_position, confirmation_id,
+                  snapshot_version, snapshot_disposition, snapshot_actual,
+                  snapshot_undeclared, snapshot_reasons,
+                  snapshot_ship_version, snapshot_ship_status,
+                  snapshot_locked_lots, snapshot_ship_reasons
+           FROM shipment_return_batch
+           WHERE return_no = ? ORDER BY position""",
+        (return_no,),
+    ).fetchall()
+    return [
+        {
+            "position": r["position"],
+            "batch_no": r["batch_no"],
+            "handover_position": r["handover_position"],
+            "confirmation_id": r["confirmation_id"],
+            "adjudication": {
+                "version": r["snapshot_version"],
+                "disposition": r["snapshot_disposition"],
+                "actual_allergens": loads(r["snapshot_actual"]),
+                "undeclared_allergens": loads(r["snapshot_undeclared"]),
+                "reasons": loads(r["snapshot_reasons"]),
+            },
+            "shipment_eligibility": {
+                "version": r["snapshot_ship_version"],
+                "status": r["snapshot_ship_status"],
+                "locked_lots": loads(r["snapshot_locked_lots"]),
+                "reasons": loads(r["snapshot_ship_reasons"]),
+            },
+        }
+        for r in rows
+    ]
+
+
+def _return_payload(conn, row) -> dict[str, Any]:
+    """单笔退回完整负载：冻结的原交接引用 + 逐批交接快照副本 + 释放名单。"""
+    batches = _return_batches(conn, row["return_no"])
+    return {
+        "return_no": row["return_no"],
+        "handover_no": row["handover_no"],
+        "verification_no": row["verification_no"],
+        "verification_revision": row["verification_revision"],
+        "confirmation_id": row["confirmation_id"],
+        "reason": row["reason"],
+        "batch_count": row["batch_count"],
+        "returned_at": row["returned_at"],
+        "batches": batches,
+        "released": [
+            {"batch_no": b["batch_no"], "handover_no": row["handover_no"]}
+            for b in batches
+        ],
+    }
+
+
+def _return_summary(conn, row) -> dict[str, Any]:
+    """退回列表项：不含逐批快照详情，仅成员顺序/批号。"""
+    members = [
+        {"position": r["position"], "batch_no": r["batch_no"]}
+        for r in conn.execute(
+            """SELECT position, batch_no FROM shipment_return_batch
+               WHERE return_no = ? ORDER BY position""",
+            (row["return_no"],),
+        ).fetchall()
+    ]
+    return {
+        "return_no": row["return_no"],
+        "handover_no": row["handover_no"],
+        "verification_no": row["verification_no"],
+        "verification_revision": row["verification_revision"],
+        "confirmation_id": row["confirmation_id"],
+        "reason": row["reason"],
+        "batch_count": row["batch_count"],
+        "returned_at": row["returned_at"],
         "batches": members,
     }
 

@@ -247,6 +247,54 @@ CREATE TABLE IF NOT EXISTS shipment_handover_occupancy (
 CREATE INDEX IF NOT EXISTS idx_hoccupancy_handover
     ON shipment_handover_occupancy(handover_no);
 
+-- 已装车交接批次的退货登记：仓库凭唯一退回号 + 原交接号 + 非空原因 +
+-- 该交接内非空无重复的批次清单登记退回（允许部分退回，未退回批次仍占用发运名额）。
+-- 退回记录只追加、不可变：冻结原交接单号/修订号/确认引用；原交接记录与
+-- 发运后复核历史均不被改写。退回批次在同一事务内释放发运占用，转为可再次发运
+-- （仍须纳入新核验单完成当前版本确认后，经新交接逐批校验发运）。
+CREATE TABLE IF NOT EXISTS shipment_return (
+    return_no             TEXT PRIMARY KEY,
+    handover_no           TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    -- 冻结原交接引用：原交接记录此后不可改写，冗余单号/修订号/确认引用便于追溯
+    verification_no       TEXT NOT NULL,
+    verification_revision INTEGER NOT NULL,
+    confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id),
+    reason                TEXT NOT NULL,          -- 非空退回原因
+    batch_count           INTEGER NOT NULL,
+    returned_at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_return_handover
+    ON shipment_return(handover_no);
+
+-- 退回逐批记录：冻结原交接逐批确认快照的不可变副本（与交接时一致）。
+-- 唯一索引 (handover_no, batch_no) 在数据库层兜底“同一批在同一交接内最多退回一次”，
+-- 已退回批次再次退回整体拒绝、不留下部分释放。
+CREATE TABLE IF NOT EXISTS shipment_return_batch (
+    return_no             TEXT NOT NULL REFERENCES shipment_return(return_no),
+    position              INTEGER NOT NULL,      -- 本次退回清单内顺序
+    batch_no              TEXT NOT NULL REFERENCES batch(batch_no),
+    handover_no           TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    handover_position     INTEGER NOT NULL,      -- 批次在原交接清单中的位置
+    confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id),
+    snapshot_version      INTEGER NOT NULL,
+    snapshot_disposition  TEXT NOT NULL,         -- RELEASE / HOLD（交接时冻结）
+    snapshot_actual       TEXT NOT NULL DEFAULT '[]',
+    snapshot_undeclared   TEXT NOT NULL DEFAULT '[]',
+    snapshot_reasons      TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_version INTEGER NOT NULL,
+    snapshot_ship_status  TEXT NOT NULL,         -- SHIPPABLE / BLOCKED（交接时冻结）
+    snapshot_locked_lots  TEXT NOT NULL DEFAULT '[]',
+    snapshot_ship_reasons TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (return_no, batch_no)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_return_batch_once
+    ON shipment_return_batch(handover_no, batch_no);
+
+CREATE INDEX IF NOT EXISTS idx_return_batch_batch
+    ON shipment_return_batch(batch_no);
+
 -- 已发运批次的发运后质量复核处置（只追加历史）。
 -- 交接后批次更正（裁决版本）、原料待检锁定（出货资格版本）或批次作废，
 -- 使“当前所见状态”相较交接冻结快照出现任一变化时即形成待复核事项；

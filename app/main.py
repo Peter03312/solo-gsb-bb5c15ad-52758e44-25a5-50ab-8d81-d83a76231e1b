@@ -17,6 +17,7 @@ from .schemas import (
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
+    ReturnIn,
     ShipmentReviewDecisionIn,
     VerificationIn,
     VerificationReviseIn,
@@ -278,6 +279,38 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def get_batch_handover(batch_no: str, service: Service = Depends(svc)):
         """追溯单批的交接归属（未发运返回 shipped=false；未知批次 404）。"""
         return service.get_batch_handover(batch_no)
+
+    # ---------------- 交接退回（退货登记） ----------------
+
+    @app.post("/api/returns", tags=["交接退回"], status_code=201)
+    def create_return(body: ReturnIn, service: Service = Depends(svc)):
+        """登记已装车交接批次的退货（允许部分退回）。
+
+        凭唯一退回号、原交接号、非空原因与该交接内非空无重复的批次清单登记退回；
+        退回记录冻结原交接单号/修订号/确认引用与逐批交接快照副本（只追加、不可变），
+        原交接记录与发运后复核历史均不改写；退回批次同事务释放发运占用、转为可再次
+        发运（仍须纳入新核验单完成当前版本确认后经新交接逐批校验发运）；未退回批次
+        仍占用发运名额。重复退回号、未知交接、非本交接或已退回批次均整体拒绝，
+        不留下部分释放。
+        """
+        return service.create_return(
+            body.return_no, body.handover_no, body.reason, body.batch_nos
+        )
+
+    @app.get("/api/returns", tags=["交接退回"])
+    def list_returns(handover_no: str | None = None, service: Service = Depends(svc)):
+        """列出交接退回记录（可按原交接号过滤）。"""
+        return service.list_returns(handover_no)
+
+    @app.get("/api/returns/{return_no}", tags=["交接退回"])
+    def get_return(return_no: str, service: Service = Depends(svc)):
+        """查询单笔退回：冻结的原交接引用、逐批交接快照副本、原因与退回时间。"""
+        return service.get_return(return_no)
+
+    @app.get("/api/batches/{batch_no}/handovers", tags=["交接退回"])
+    def get_batch_handovers(batch_no: str, service: Service = Depends(svc)):
+        """按批次查询历次交接、退回及当前去向（每批同一时刻最多一笔未退回交接）。"""
+        return service.get_batch_handovers(batch_no)
 
     # ---------------- 已发运批次发运后质量复核 ----------------
 

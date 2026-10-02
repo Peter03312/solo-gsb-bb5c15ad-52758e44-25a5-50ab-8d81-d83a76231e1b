@@ -50,6 +50,16 @@
 时间**；后续更正、待复核或清单修订**一律不改写交接记录**，并可逐批**追溯每批的交接归属**。
 重复交接号、未知单据、状态/版本冲突、任一不合格批次均**整体拒绝、不留下部分占用**。
 
+**仓库收到已装车交接批次的退货**时，凭**原交接号、唯一退回号、非空原因与该交接内
+非空无重复的批次清单**登记退回（`POST /api/returns`）。**允许部分退回**，未退回批次
+仍占用发运名额；退回记录**冻结原交接单号/修订号/确认引用与逐批交接快照副本**
+（只追加、不可变），**原交接记录与发运后复核历史均不可改写**，交接详情仍显示当时
+完整清单并逐批标注退回。退回批次在同一事务内**释放发运占用、转为可再次发运**，
+但须**纳入新核验单完成当前版本确认**后经新交接发运（新交接仍按现有有效批次、放行、
+出货资格与版本规则逐批校验）。**每批同一时刻最多一笔未退回交接**，可按批次查询
+**历次交接、退回及当前去向**。重复退回号、未知交接、非本交接或已退回批次均
+**整体拒绝，不留下部分释放**。
+
 - 技术栈：Python 3.11 + FastAPI + SQLite（标准库 `sqlite3`，WAL 模式）
 - 数据落盘：单个 SQLite 文件，Docker 卷持久化
 - 一键启动：`docker compose up`（首次启动自动建表、写入过敏原字典与演示原料批号）
@@ -219,6 +229,45 @@
 | `handover_no` / `verification_no` 为空 | 400 | `INVALID_PAYLOAD` |
 | `expected_revision` 缺失或 < 1 | 422 | FastAPI 模型校验 |
 
+### 交接退回（退货登记）
+
+仓库收到已装车交接批次的退货时，凭**原交接号、唯一退回号、非空原因与该交接内
+非空无重复的批次清单**登记退回（`POST /api/returns`，请求体
+`{"return_no","handover_no","reason","batch_nos"}`）：
+
+- **允许部分退回**：退回清单可以是交接清单的任意非空子集（按提交顺序保存）；
+  **未退回批次仍占用发运名额**，含未退回批次的新交接仍按占用规则整单拒绝。
+- **冻结引用、只追加、不可变**：退回记录冻结原交接的核验单号、交接时修订号、
+  最近一次确认引用与**逐批交接确认快照副本**（含批次在原交接清单中的位置）；
+  退回**不改写**原交接记录、核验单状态/修订号、裁决/出货资格版本与发运后复核历史。
+- **交接详情仍显示当时完整清单**：`GET /api/handovers/{handover_no}` 的逐批清单
+  保持交接当时全量成员与冻结快照，已退回批次以 `returned` / `return` 标注，
+  顶层 `returns` / `returned_batch_count` / `fully_returned` 汇总退回情况。
+- **退回批次转为可再次发运**：退回在同一事务内释放这些批次的发运占用；
+  再次发运须**纳入新核验单完成当前版本确认**（创建 → 确认 → 新交接），
+  新交接仍按现有有效批次、放行、出货资格与版本规则逐批校验。
+- **每批同一时刻最多一笔未退回交接**：`GET /api/batches/{batch_no}/handovers`
+  按批次列出**历次交接、每笔是否已退回及退回记录、当前去向**（`current` 为当前
+  未退回的交接占用）；`GET /api/batches/{batch_no}/handover` 仍返回当前归属。
+- **整体拒绝、不留部分释放**：重复退回号 409、未知交接 404、空原因 400、
+  空清单/清单内重复批次 400/422、非本交接批次 404、已退回批次 409——全部在同一
+  `BEGIN IMMEDIATE` 事务内校验并回滚，不写退回记录、不释放任何批次；
+  数据库层以 `(handover_no, batch_no)` 唯一索引兜底“同一批在同一交接内最多退回一次”。
+
+退回拒绝码：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 退回号重复 | 409 | `DUPLICATE_RETURN` |
+| 原交接不存在 | 404 | `HANDOVER_NOT_FOUND` |
+| 退回原因为空/纯空白 | 400 | `INVALID_PAYLOAD` |
+| `return_no` / `handover_no` 为空 | 400 | `INVALID_PAYLOAD` |
+| 批次清单为空 / 缺字段 | 422 | FastAPI 模型校验 |
+| 清单内批次号重复或元素空白 | 400 | `DUPLICATE_BATCH_IN_RETURN` / `INVALID_PAYLOAD` |
+| 批次不属于该交接（含未知批次） | 404 | `BATCH_NOT_IN_HANDOVER`（`details` 逐批说明） |
+| 批次在该交接内已退回 | 409 | `BATCH_ALREADY_RETURNED`（`details` 含原退回号） |
+| 退回记录不存在 | 404 | `RETURN_NOT_FOUND` |
+
 拒绝规则（失败时整个请求回滚，**不留下部分改动**）：
 
 | 场景 | HTTP | error.code |
@@ -304,7 +353,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 178 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、装车交接、已发运批次发运后质量复核（逐批快照对比/只追加处置/同状态不重复/过期所见拒绝/旧库升级）、旧库升级
+python -m pytest -q            # 197 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、装车交接、已发运批次发运后质量复核（逐批快照对比/只追加处置/同状态不重复/过期所见拒绝/旧库升级）、交接退回（部分退回/冻结引用/释放再发运/整体拒绝/旧库升级）、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -344,6 +393,11 @@ BASE_URL=http://127.0.0.1:8080 python examples/shipment_handover_demo.py
 #   只追加历史、后续变化再次待复核、同状态不重复、过期所见/未知交接/非其批次/空原因拒绝）
 python examples/shipment_review_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/shipment_review_demo.py
+
+# 交接退回（退货登记）端到端示例（部分退回/冻结原交接引用与逐批快照/未退回仍占用/
+#   退回批次新核验单确认后再发运/交接详情仍显示当时完整清单/整体拒绝不留部分释放/逐批去向追溯）
+python examples/shipment_return_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/shipment_return_demo.py
 ```
 
 ---
@@ -852,6 +906,75 @@ DRAFT ──confirm 成功──▶ CONFIRMED
 交接拒绝码见上文[业务规则](#装车交接整单发运)；全部在单事务内校验，失败整体回滚、
 不留下部分占用。
 
+### 交接退回（退货登记）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/returns` | **登记退回**：凭唯一退回号 + 原交接号 + 非空原因 + 该交接内非空无重复批次清单（允许部分退回）；同事务冻结原交接引用与逐批交接快照副本、释放退回批次的发运占用 |
+| GET | `/api/returns` | 列出退回记录（可 `?handover_no=` 过滤） |
+| GET | `/api/returns/{return_no}` | 退回详情：冻结的原交接单号/修订号/确认引用、逐批交接快照副本、原因与退回时间 |
+| GET | `/api/batches/{batch_no}/handovers` | 按批次查**历次交接、退回及当前去向**（每批同一时刻最多一笔未退回交接；未知批次 404） |
+
+退回请求体：
+
+```json
+{
+  "return_no": "RT-20261002-01",
+  "handover_no": "HO-20261002-01",
+  "reason": "客户拒收：外包装破损，整托退回",
+  "batch_nos": ["B002", "B001"]
+}
+```
+
+成功响应（201）顶层字段：
+
+```jsonc
+{
+  "return_no": "RT-20261002-01",
+  "handover_no": "HO-20261002-01",
+  "verification_no": "SH-20260930-01",   // 冻结：原交接的核验单号
+  "verification_revision": 2,            // 冻结：交接时的单据修订号
+  "confirmation_id": 1,                  // 冻结：原交接依据的最近一次确认
+  "reason": "客户拒收：外包装破损，整托退回",
+  "batch_count": 2,
+  "returned_at": "2026-10-02T...",
+  "batches": [ /* 逐批交接确认快照的不可变副本，按退回清单顺序 */
+    {
+      "position": 1, "batch_no": "B002",
+      "handover_position": 2,            // 批次在原交接清单中的位置
+      "confirmation_id": 1,
+      "adjudication":         { "version": 1, "disposition": "RELEASE", /* actual/undeclared/reasons */ },
+      "shipment_eligibility": { "version": 1, "status": "SHIPPABLE", "locked_lots": [], "reasons": [/*...*/] }
+    }
+  ],
+  "released": [ {"batch_no": "B002", "handover_no": "HO-20261002-01"} ]  // 本次释放的发运占用
+}
+```
+
+`GET /api/batches/{batch_no}/handovers` 的去向负载：
+
+```jsonc
+{
+  "batch_no": "B001",
+  "shipped": true,                        // 当前是否处于未退回的交接占用中
+  "current": { "handover_no": "HO-002", "verification_no": "SH-002",
+               "verification_revision": 2, "confirmation_id": 3,
+               "position": 1, "handed_over_at": "..." },
+  "handovers": [                          // 历次交接（按交接时间），逐笔标注退回
+    { "handover_no": "HO-001", "position": 1, "handed_over_at": "...",
+      "returned": true,
+      "return": { "return_no": "RT-001", "reason": "...", "returned_at": "..." } },
+    { "handover_no": "HO-002", "position": 1, "handed_over_at": "...",
+      "returned": false, "return": null }
+  ]
+}
+```
+
+交接详情（`GET /api/handovers/{handover_no}`）仍显示**当时完整清单**：逐批冻结快照
+不变，已退回批次附 `returned: true` 与 `return`（退回号/原因/时间），顶层附
+`returns`（退回记录摘要）、`returned_batch_count` 与 `fully_returned`；
+退回批次释放占用后可经**新核验单确认 + 新交接**再次发运，未退回批次仍被原交接占用。
+
 ### 已发运批次发运后质量复核
 
 | 方法 | 路径 | 说明 |
@@ -1074,6 +1197,40 @@ curl -s -X POST http://127.0.0.1:8080/api/handovers/HO-001/reviews/B001/decision
 #     409 REVIEW_STATE_STALE（details.stale_fields 指明哪类不一致，重新查询取新 seen_state）；
 #     无变化状态处置 409 REVIEW_NOT_REQUIRED；未知交接/非其批次 404；空原因/非法结论 400；均不写入
 curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获取最新 seen_state 后再处置
+
+# 30) 交接退回：仓库收到退货，凭唯一退回号 + 原交接号 + 非空原因 + 交接内批次清单登记
+#     （允许部分退回；退回记录冻结原交接引用与逐批交接快照副本；
+#      退回批次同事务释放发运占用，未退回批次仍占用发运名额）
+curl -s -X POST http://127.0.0.1:8080/api/returns \
+  -H 'Content-Type: application/json' \
+  -d '{"return_no":"RT-001","handover_no":"HO-001","reason":"客户拒收：外包装破损，整托退回",
+       "batch_nos":["B001"]}'
+
+# 31) 交接详情仍显示当时完整清单（逐批冻结快照不变，已退回批次标注 returned/return，
+#     顶层 returns/returned_batch_count/fully_returned 汇总）；退回列表与详情查询
+curl -s http://127.0.0.1:8080/api/handovers/HO-001
+curl -s 'http://127.0.0.1:8080/api/returns?handover_no=HO-001'
+curl -s http://127.0.0.1:8080/api/returns/RT-001
+
+# 32) 拒绝（整体回滚、不留下部分释放）：重复退回号 409 DUPLICATE_RETURN、未知交接 404、
+#     空原因 400、清单内重复批次 400、非本交接批次 404 BATCH_NOT_IN_HANDOVER、
+#     已退回批次 409 BATCH_ALREADY_RETURNED（details 指向原退回号）
+curl -s -X POST http://127.0.0.1:8080/api/returns \
+  -H 'Content-Type: application/json' \
+  -d '{"return_no":"RT-001","handover_no":"HO-001","reason":"重复退回号","batch_nos":["B001"]}'
+
+# 33) 退回批次再次发运：纳入新核验单完成当前版本确认 -> 新交接
+#     （新交接仍按现有有效批次/放行/出货资格/版本规则逐批校验）
+curl -s -X POST http://127.0.0.1:8080/api/verifications \
+  -H 'Content-Type: application/json' \
+  -d '{"verification_no":"SH-002","batch_nos":["B001"]}'
+curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-002/confirm
+curl -s -X POST http://127.0.0.1:8080/api/handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"handover_no":"HO-002","verification_no":"SH-002","expected_revision":2}'
+
+# 34) 按批次查历次交接、退回及当前去向（每批同一时刻最多一笔未退回交接）
+curl -s http://127.0.0.1:8080/api/batches/B001/handovers
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -1105,7 +1262,12 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 （按交接号逐批并列冻结快照与当前版本/作废状态 → 待检锁定/作废/裁决新版本即待复核
 即使仍放行 → 凭所见两类当前版本+作废状态记录需召回/无需召回与非空原因 →
 只追加历史、已复核后新变化再次待复核 → 同一状态不重复、过期所见/未知交接/非其批次/
-空原因/非法结论拒绝 → 交接冻结快照始终不变）。
+空原因/非法结论拒绝 → 交接冻结快照始终不变）；
+交接退回（退货登记）全流程示例见 [`examples/shipment_return_demo.py`](examples/shipment_return_demo.py)
+（部分退回 → 冻结原交接引用与逐批交接快照副本 → 未退回批次仍占用、退回批次释放 →
+交接详情仍显示当时完整清单并标注退回 → 重复退回号/未知交接/空原因/非本交接/已退回
+整体拒绝不留部分释放 → 退回批次经新核验单确认后新交接再发运 → 按批次查历次交接、
+退回及当前去向）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -1120,7 +1282,7 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 │   ├── allergens.py     # 14 项过敏原受控字典
 │   ├── errors.py        # 业务错误（code + HTTP 状态码）
 │   ├── db.py            # SQLite 连接、建表、事务、初始化/种子
-│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接、发运后复核
+│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接、发运后复核、交接退回
 │   ├── schemas.py       # 请求模型
 │   ├── main.py          # FastAPI 路由
 │   └── __main__.py      # python -m app 入口
@@ -1131,6 +1293,7 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
 ├── examples/shipment_handover_demo.py # 装车交接（整单发运/冻结快照/占用追溯）端到端调用示例
 ├── examples/shipment_review_demo.py # 已发运批次发运后质量复核（逐批对比/只追加处置/乐观所见）端到端调用示例
+├── examples/shipment_return_demo.py # 交接退回（部分退回/冻结引用/释放再发运/去向追溯）端到端调用示例
 ├── examples/verification_revise_demo.py # 出货前批次清单修订（乐观修订号）端到端调用示例
 ├── examples/cleaning_preview_demo.py # 开工前清洁更正预演（只读）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
@@ -1142,6 +1305,7 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 ├── tests/test_cleaning_preview.py # pytest 测试（清洁更正预演：逐批推演/版本影响范围/跳过作废批/锁定不参与/只读性/与正式更正一致/拒绝，20 项）
 ├── tests/test_shipment_handover.py # pytest 测试（装车交接：冻结快照/状态版本门禁/占用唯一/并发原子性/不可变追溯/旧库升级，20 项）
 ├── tests/test_shipment_review.py  # pytest 测试（发运后复核：逐批快照对比/版本或作废即待复核/只追加处置/同状态不重复/过期所见拒绝/并发一致/旧库升级，17 项）
+├── tests/test_shipment_return.py  # pytest 测试（交接退回：部分退回/冻结引用/释放再发运/交接详情完整清单/整体拒绝/并发一致/旧库升级，19 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -1171,7 +1335,13 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 - `shipment_handover_batch`：交接时逐批冻结的**最近一次确认快照**不可变副本
   （裁决版本/结论 + 出货资格版本/状态，按确认清单顺序保序）
 - `shipment_handover_occupancy`：每批全局唯一的已发运占用（`batch_no` 主键），
-  数据库层兜底“任一批次已在其他交接记录发运即整单拒绝、不得重复发运”
+  数据库层兜底“任一批次已在其他交接记录发运即整单拒绝、不得重复发运”；
+  退回时同事务删除对应行释放名额（occupancy 即“当前未退回占用”）
+- `shipment_return`：交接退回主记录（唯一退回号 → 原交接号、冻结的原交接核验单号/
+  交接时修订号/最近一次确认引用、非空原因、批次数、退回时间）；只追加、不可变
+- `shipment_return_batch`：退回逐批记录——冻结原交接逐批确认快照的不可变副本
+  （含批次在原交接清单中的位置）；唯一索引 `(handover_no, batch_no)` 在数据库层
+  兜底“同一批在同一交接内最多退回一次”，已退回批次再次退回整体拒绝、不留部分释放
 - `shipment_review`：已发运批次发运后复核处置的**只追加**历史（交接号+批次+
   处置时所见的当前裁决版本/出货资格版本/作废状态 + `RECALL_REQUIRED`/`NO_RECALL`
   处置结论与非空原因 + 处置时间）；唯一索引
@@ -1185,8 +1355,12 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获�
 装车交接在同一事务内完成“状态/修订号/逐批版本结论/已发运占用”全部校验与
 主记录、逐批确认快照冻结副本、全单批次占用的写入，重复交接号、未知单据、状态/版本
 冲突、任一不合格批次均整体回滚，不写入交接记录、不留下部分占用；
-新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入（含三张装车交接表与发运后复核处置表
-`shipment_review` 及其唯一索引），既有快照表新增列与
+交接退回在同一事务内完成“退回号唯一/交接存在/清单属于该交接/均未退回”全部校验与
+退回主记录、逐批交接快照冻结副本的写入及退回批次占用释放，重复退回号、未知交接、
+非本交接或已退回批次均整体回滚，不写退回记录、不留下部分释放；
+新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入（含三张装车交接表、发运后复核处置表
+`shipment_review` 及其唯一索引，以及交接退回表 `shipment_return` /
+`shipment_return_batch` 及其唯一索引），既有快照表新增列与
 `verification.revision` 修订号列通过 `ALTER TABLE`（逐列检查）幂等补齐
 （既有单据修订号按 1 计），旧数据库启动时自动升级，
 并为既有批次补出货资格 v1（`UPGRADE_INIT`，不改变既有核验单状态；升级前的旧确认快照
